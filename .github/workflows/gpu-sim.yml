@@ -1,0 +1,123 @@
+name: GPU Simulator
+
+# The hosted runners have no GPU, so the CUDA C variants are never run in CI.
+# This builds them with nvcc and GNU and runs their ctest cases (1000 columns,
+# NPROMA 128) on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - "src/cloudsc_cuda/**"
+      - "src/common/**"
+      - "src/CMakeLists.txt"
+      - "cmake/**"
+      - "config-files/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-c:
+    name: CUDA C variants on simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated H100 and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@68edfd58c091361dd6baf060b63de412e544d858 # v0.1.7
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      - name: Install gfortran, HDF5, Ninja and ecbuild
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran libhdf5-dev ninja-build
+          git clone --depth 1 --branch 3.11.0 https://github.com/ecmwf/ecbuild.git "$RUNNER_TEMP/ecbuild"
+
+      # Two build-only edits for the simulator, which runs PTX:
+      # - with CMAKE_CUDA_ARCHITECTURES set, CLOUDSC_CUDA_FLAGS adds
+      #   `-gencode arch=compute_90,code=sm_90`, which leaves no PTX in the
+      #   binaries, so make it `code=compute_90`;
+      # - the CUDA-Fortran common library links OpenACC::OpenACC_Fortran
+      #   unconditionally, which does not exist with gfortran; guard it with
+      #   HAVE_ACC like the other uses (the CUDA C variants do not use it).
+      - name: Patch the build for PTX and gfortran
+        run: |
+          sed -i 's/code=sm_${CMAKE_CUDA_ARCHITECTURES}"/code=compute_${CMAKE_CUDA_ARCHITECTURES}"/' cmake/features/CUDA.cmake
+          sed -i 's/^\( *\)OpenACC::OpenACC_Fortran$/\1$<${HAVE_ACC}:OpenACC::OpenACC_Fortran>/' src/common/CMakeLists.txt
+          git diff
+
+      # ECBUILD_DISABLE_NEW_DTAGS=OFF gives RUNPATH instead of RPATH, so
+      # `vgpu run` can put the simulator's libcudart ahead of the toolkit's.
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -Decbuild_DIR="$RUNNER_TEMP/ecbuild/cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+            -DCMAKE_CUDA_ARCHITECTURES=90 \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+            -DECBUILD_DISABLE_NEW_DTAGS=OFF \
+            -DENABLE_CUDA=ON \
+            -DENABLE_CLOUDSC_MIX=OFF \
+            -DENABLE_LOKI=OFF \
+            -DENABLE_FIELD_API=OFF \
+            -DENABLE_ATLAS=OFF \
+            -DENABLE_HIP=OFF \
+            -DENABLE_SYCL=OFF \
+            -DENABLE_MPI=OFF
+
+      - name: Build the CUDA C variants
+        run: |
+          targets=()
+          for v in c c-hoist c-k-caching c-opt; do
+            for p in dp sp; do targets+=("dwarf-cloudsc-gpu-cuda-$v-$p"); done
+          done
+          cmake --build build -j3 --target "${targets[@]}"
+
+      - name: Test on the simulated H100
+        run: |
+          set -o pipefail
+          vgpu run --gpu nvidia/h100 ctest --test-dir build -R gpu-cuda-c -V --no-tests=error | tee ctest.log
+
+      # The binaries print the error against reference.h5 but always exit 0,
+      # so check the table here: all 8 tests, 21 fields each. Double precision
+      # matches the reference to about 1e-12 %, except PFPLSN and PFHPSN in the
+      # opt variant (4.4 %, also on real GPUs); single precision is compared
+      # with the double-precision reference, so it only catches gross errors.
+      - name: Check the results against the reference data
+        run: |
+          awk '
+            /^ *Start +[0-9]+: / { id = $2; sub(/:$/, "", id); name[id] = $3; next }
+            $1 ~ /^[0-9]+:$/ && $3 ~ /^[123]D[0-9]$/ {
+              id = $1; sub(/:$/, "", id); rows[id]++
+              tol = 1e-6
+              if (name[id] ~ /-sp-/) tol = 20
+              else if (name[id] ~ /-opt-/ && $2 ~ /^PF(PLSN|HPSN)$/) tol = 5
+              if ($8 + 0 > tol) { print name[id] ": " $2 " MaxRelErr-% " $8 " > " tol; bad++ }
+            }
+            END {
+              for (id in name) {
+                if (rows[id] != 21) { print name[id] ": " rows[id] + 0 " of 21 fields validated"; bad++ }
+                n++
+              }
+              if (n != 8) { print n " tests ran, expected 8"; bad++ }
+              if (bad) exit 1
+              print "all " n " tests within tolerance"
+            }' ctest.log
